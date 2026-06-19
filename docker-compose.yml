@@ -1,0 +1,320 @@
+# ════════════════════════════════════════════════════════════
+# Demo StarRocks — 2 phương án trong 1 stack (Compose profiles)
+#
+#   Service dùng chung (không profile): starrocks, superset
+#   profile "c" : kafka, kafka-init, producer, starrocks-init   → Phương án C (realtime Kafka)
+#   profile "b" : minio, minio-init, iceberg-rest, starrocks-init-b → Phương án B (Iceberg serving mart)
+#
+# Chạy:
+#   docker compose --profile c up -d --build        # demo C
+#   docker compose --profile b up -d --build        # demo B
+#   docker compose --profile b --profile c up -d --build   # cả hai
+# (Dùng scripts/demo.ps1 up c | b | all cho tiện)
+# ════════════════════════════════════════════════════════════
+
+services:
+
+  # ════════════════════════════════════════════════════════════
+  # SHARED — chạy cho cả demo B và C
+  # ════════════════════════════════════════════════════════════
+
+  # ──────────────────────────────────────────────────────────
+  # STARROCKS (all-in-one: FE + BE trong 1 container)
+  # ──────────────────────────────────────────────────────────
+  starrocks:
+    image: starrocks/allin1-ubuntu:3.3-latest
+    container_name: demo_starrocks
+    hostname: starrocks
+    # AWS_REGION cho FE Java AWS SDK (Iceberg commit metadata lên MinIO).
+    # Vô hại với demo C; chỉ demo B dùng tới.
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${MINIO_USER:-minio}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_PASSWORD:-minio12345}
+      - AWS_ENDPOINT_URL=http://minio:9000
+      - AWS_ENDPOINT_URL_S3=http://minio:9000
+    ports:
+      - "9030:9030"   # MySQL query port (Superset kết nối đây)
+      - "8030:8030"   # FE HTTP port (Web UI)
+      - "8040:8040"   # BE HTTP port
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -P 9030 -uroot --connect-timeout=5 -e 'SELECT 1' 2>/dev/null | grep -c 1 || exit 1"]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 90s   # StarRocks allin1 cần ~60-90s để khởi động
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # SUPERSET: BI dashboard
+  # ──────────────────────────────────────────────────────────
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: demo_superset
+    hostname: superset
+    ports:
+      - "8088:8088"
+    environment:
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY:-demo_secret_key_starrocks_2026}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-admin@demo.local}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - STARROCKS_HOST=starrocks
+      - STARROCKS_PORT=9030
+    volumes:
+      - superset-home:/app/superset_home   # giữ connection + dashboard qua restart
+    depends_on:
+      starrocks:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - demo-net
+
+  # ════════════════════════════════════════════════════════════
+  # PROFILE "c" — Phương án C: realtime Kafka → StarRocks
+  # ════════════════════════════════════════════════════════════
+
+  # ──────────────────────────────────────────────────────────
+  # KAFKA (Confluent KRaft mode - không cần Zookeeper)
+  # ──────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: demo_kafka
+    hostname: kafka
+    profiles: ["c"]
+    ports:
+      - "9094:9094"   # External: host machine dùng port này để test
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      # Listeners:
+      #   PLAINTEXT://kafka:9092  → internal (StarRocks + producer container dùng)
+      #   CONTROLLER://kafka:9093 → KRaft controller
+      #   EXTERNAL://0.0.0.0:9094 → host machine access
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qg"
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # KAFKA-INIT: Tạo topic sales_events
+  # ──────────────────────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: demo_kafka_init
+    profiles: ["c"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - bash
+      - -c
+      - |
+        echo '=========================================='
+        echo 'Tao topic: sales_events'
+        echo '=========================================='
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic sales_events --partitions 3 --replication-factor 1
+        echo 'Topic created!'
+        kafka-topics --bootstrap-server kafka:9092 --describe --topic sales_events
+        echo 'Done!'
+
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # STARROCKS-INIT (C): Tạo DB demo, table rt_sales_events, Routine Load
+  # ──────────────────────────────────────────────────────────
+  starrocks-init:
+    image: mysql:8.0
+    container_name: demo_starrocks_init
+    profiles: ["c"]
+    depends_on:
+      starrocks:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./sql:/sql:ro
+      - ./init:/init:ro
+    command: bash /init/init_starrocks.sh
+    environment:
+      - STARROCKS_HOST=starrocks
+      - STARROCKS_PORT=9030
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # PRODUCER: Sinh event giả lập vào Kafka liên tục
+  # ──────────────────────────────────────────────────────────
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: demo_producer
+    profiles: ["c"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - KAFKA_TOPIC=sales_events
+      - EVENTS_PER_SECOND=${EVENTS_PER_SECOND:-2}
+    restart: unless-stopped
+    networks:
+      - demo-net
+
+  # ════════════════════════════════════════════════════════════
+  # PROFILE "b" — Phương án B: StarRocks đọc Iceberg DTM → native mart / MV
+  #   MinIO (S3) + Iceberg REST catalog đóng vai "kho DTM giả".
+  #   Không cần Spark: StarRocks tự ghi mock data vào Iceberg.
+  # ════════════════════════════════════════════════════════════
+
+  # ──────────────────────────────────────────────────────────
+  # MINIO: object storage S3-compatible, lưu file Iceberg
+  # ──────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: demo_minio
+    hostname: minio
+    profiles: ["b"]
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO console (web UI)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minio12345}
+      # MINIO_DOMAIN bật virtual-host addressing (bucket.minio). StarRocks FE
+      # commit Iceberg dùng virtual-host style nên cần cái này + network alias dưới.
+      MINIO_DOMAIN: minio
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data       # giữ file Iceberg qua restart/recreate
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 10s
+    networks:
+      demo-net:
+        aliases:
+          - warehouse.minio   # để FE resolve được host virtual-style bucket.minio
+
+  # ──────────────────────────────────────────────────────────
+  # MINIO-INIT: tạo bucket "warehouse" cho Iceberg
+  # ──────────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
+    container_name: demo_minio_init
+    profiles: ["b"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        echo 'Configuring mc alias...'
+        mc alias set local http://minio:9000 ${MINIO_USER:-minio} ${MINIO_PASSWORD:-minio12345}
+        echo 'Creating bucket: warehouse'
+        mc mb --ignore-existing local/warehouse
+        echo 'Bucket ready:'
+        mc ls local
+        echo 'Done!'
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # ICEBERG-REST: Iceberg REST catalog (thay cho Hive Metastore)
+  # ──────────────────────────────────────────────────────────
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.2
+    container_name: demo_iceberg_rest
+    hostname: iceberg-rest
+    profiles: ["b"]
+    user: root   # để ghi được sqlite catalog trên volume /persist
+    ports:
+      - "8181:8181"
+    environment:
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      # Catalog metadata lưu file sqlite trên volume -> namespace/table sống qua restart
+      - CATALOG_URI=jdbc:sqlite:file:/persist/catalog.db
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      - AWS_ACCESS_KEY_ID=${MINIO_USER:-minio}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_PASSWORD:-minio12345}
+      - AWS_REGION=us-east-1
+    volumes:
+      - iceberg-cat:/persist
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - demo-net
+
+  # ──────────────────────────────────────────────────────────
+  # STARROCKS-INIT (B): tạo Iceberg catalog, seed DTM, native mart + MV
+  # ──────────────────────────────────────────────────────────
+  starrocks-init-b:
+    image: mysql:8.0
+    container_name: demo_starrocks_init_b
+    profiles: ["b"]
+    depends_on:
+      starrocks:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./sql:/sql:ro
+      - ./init:/init:ro
+    command: bash /init/init_demo_b.sh
+    environment:
+      - STARROCKS_HOST=starrocks
+      - STARROCKS_PORT=9030
+      - MINIO_USER=${MINIO_USER:-minio}
+      - MINIO_PASSWORD=${MINIO_PASSWORD:-minio12345}
+      - SEED_ROWS=${SEED_ROWS:-1000000}
+    networks:
+      - demo-net
+
+networks:
+  demo-net:
+    driver: bridge
+    name: demo-net
+
+volumes:
+  minio-data:        # file Iceberg (demo B)
+  iceberg-cat:       # catalog metadata sqlite (demo B)
+  superset-home:     # Superset metadata: connection + dashboard

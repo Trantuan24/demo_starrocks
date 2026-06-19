@@ -1,0 +1,5 @@
+# Test script dependencies
+# Chạy: pip install -r scripts/requirements-test.txt
+
+kafka-python-ng>=2.2.3
+pymysql==1.1.0
