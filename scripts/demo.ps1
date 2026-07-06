@@ -5,7 +5,9 @@ param(
         "starrocks", "routine-load", "count", "mysql", "test", "setup",
         "dashboard",
         # Demo B (Iceberg serving mart)
-        "benchmark", "setup-b", "dashboard-b", "mysql-b", "count-b"
+        "benchmark", "setup-b", "dashboard-b", "mysql-b", "count-b",
+        # Demo A (đọc thẳng External Catalog Iceberg)
+        "query-a", "benchmark-ab"
     )]
     [string]$Command = "status",
 
@@ -101,5 +103,13 @@ switch ($Command) {
     }
     "count-b" {
         Invoke-Compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root -e "SELECT COUNT(*) AS dtm_rows FROM iceberg_dtm.dtm.fact_sales; SELECT COUNT(*) AS mart_rows FROM serving.ads_revenue_daily;"
+    }
+
+    # ── Demo A (đọc thẳng External Catalog Iceberg) ──
+    "query-a" {
+        Get-Content sql/A_01_direct_query.sql | Invoke-Compose exec -T starrocks mysql -h 127.0.0.1 -P 9030 -u root
+    }
+    "benchmark-ab" {
+        python scripts/benchmark_a_vs_b.py
     }
 }
