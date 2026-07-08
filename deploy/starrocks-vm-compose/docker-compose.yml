@@ -1,0 +1,53 @@
+services:
+  starrocks-fe:
+    image: starrocks/fe-ubuntu:4.1.1
+    container_name: starrocks-fe
+    hostname: starrocks-fe
+    restart: unless-stopped
+    networks:
+      - starrocks-net
+    ports:
+      - "8030:8030"
+      - "9020:9020"
+      - "9030:9030"
+      - "9010:9010"
+    volumes:
+      - ./conf/fe/fe.conf:/opt/starrocks/fe/conf/fe.conf:ro
+      - ./data/fe/meta:/opt/starrocks/fe/meta
+      - ./data/fe/log:/opt/starrocks/fe/log
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/9030'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  starrocks-be:
+    image: starrocks/be-ubuntu:4.1.1
+    container_name: starrocks-be
+    hostname: starrocks-be
+    restart: unless-stopped
+    depends_on:
+      starrocks-fe:
+        condition: service_started
+    networks:
+      - starrocks-net
+    ports:
+      - "8040:8040"
+      - "8060:8060"
+      - "9050:9050"
+      - "9060:9060"
+    volumes:
+      - ./conf/be/be.conf:/opt/starrocks/be/conf/be.conf:ro
+      - ./data/be/storage:/opt/starrocks/be/storage
+      - ./data/be/log:/opt/starrocks/be/log
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/9050'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+networks:
+  starrocks-net:
+    name: starrocks-net
