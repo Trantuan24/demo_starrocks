@@ -1,6 +1,7 @@
 services:
   starrocks-fe:
     image: starrocks/fe-ubuntu:4.1.1
+    command: ["/opt/starrocks/fe/bin/start_fe.sh"]
     container_name: starrocks-fe
     hostname: starrocks-fe
     restart: unless-stopped
@@ -24,6 +25,7 @@ services:
 
   starrocks-be:
     image: starrocks/be-ubuntu:4.1.1
+    command: ["/opt/starrocks/be/bin/start_be.sh"]
     container_name: starrocks-be
     hostname: starrocks-be
     restart: unless-stopped
